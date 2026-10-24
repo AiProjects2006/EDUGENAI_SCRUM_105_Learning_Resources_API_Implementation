@@ -3,13 +3,19 @@ package com.ailearning.learning_resource_service.dto.response;
 import com.ailearning.learning_resource_service.enums.ResourceStatus;
 import com.ailearning.learning_resource_service.enums.ResourceType;
 import com.ailearning.learning_resource_service.enums.StorageProvider;
+import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 
 import java.time.LocalDateTime;
 
 @Getter
+@Setter
 @Builder
+@NoArgsConstructor
+@AllArgsConstructor
 public class StudentResourceResponse {
 
     private Long resourceId;

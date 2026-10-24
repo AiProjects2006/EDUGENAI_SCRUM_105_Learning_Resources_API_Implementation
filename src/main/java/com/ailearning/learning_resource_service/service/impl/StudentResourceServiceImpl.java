@@ -6,17 +6,34 @@ import com.ailearning.learning_resource_service.dto.response.StudentResourceResp
 import com.ailearning.learning_resource_service.entity.StudentResource;
 import com.ailearning.learning_resource_service.exception.ResourceNotFoundException;
 import com.ailearning.learning_resource_service.repository.StudentResourceRepository;
+import com.ailearning.learning_resource_service.service.RedisCacheService;
 import com.ailearning.learning_resource_service.service.StudentResourceService;
-import lombok.RequiredArgsConstructor;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
 
+@Slf4j
 @Service
-@RequiredArgsConstructor
 public class StudentResourceServiceImpl implements StudentResourceService {
 
     private final StudentResourceRepository studentResourceRepository;
+    private final RedisCacheService redisCacheService;
+    private final ObjectMapper objectMapper;
+
+    @Value("${app.cache.resource.ttl-seconds:86400}")
+    private long cacheTtlSeconds;
+
+    public StudentResourceServiceImpl(StudentResourceRepository studentResourceRepository,
+                                      RedisCacheService redisCacheService,
+                                      ObjectMapper objectMapper) {
+        this.studentResourceRepository = studentResourceRepository;
+        this.redisCacheService = redisCacheService;
+        this.objectMapper = objectMapper;
+    }
 
     @Override
     public StudentResourceResponse createResource(
@@ -35,35 +52,74 @@ public class StudentResourceServiceImpl implements StudentResourceService {
                 .sortOrder(request.getSortOrder())
                 .build();
 
-        StudentResource savedResource =
-                studentResourceRepository.save(resource);
+        StudentResource savedResource = studentResourceRepository.save(resource);
+        StudentResourceResponse response = mapToResponse(savedResource);
 
-        return mapToResponse(savedResource);
+        evictResourceCache(savedResource.getResourceId(), savedResource.getModuleId());
+
+        return response;
     }
 
     @Override
     public List<StudentResourceResponse> getResourcesByModule(
             Long moduleId) {
 
-        return studentResourceRepository
+        String cacheKey = "resource:module:" + moduleId;
+        String cached = redisCacheService.get(cacheKey);
+        if (cached != null && !cached.isBlank()) {
+            try {
+                log.info("Redis cache HIT for key [{}]", cacheKey);
+                return objectMapper.readValue(cached, new TypeReference<List<StudentResourceResponse>>() {});
+            } catch (Exception e) {
+                log.warn("Failed to deserialize cached module resources: {}", e.getMessage());
+            }
+        }
+
+        log.info("Redis cache MISS for key [{}], reading from Resources DB", cacheKey);
+        List<StudentResourceResponse> resources = studentResourceRepository
                 .findByModuleId(moduleId)
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
+
+        try {
+            redisCacheService.set(cacheKey, objectMapper.writeValueAsString(resources), cacheTtlSeconds);
+        } catch (Exception e) {
+            log.warn("Failed to cache module resources in Redis: {}", e.getMessage());
+        }
+
+        return resources;
     }
 
     @Override
     public StudentResourceResponse getResource(Long resourceId) {
 
+        String cacheKey = "resource:id:" + resourceId;
+        String cached = redisCacheService.get(cacheKey);
+        if (cached != null && !cached.isBlank()) {
+            try {
+                log.info("Redis cache HIT for key [{}]", cacheKey);
+                return objectMapper.readValue(cached, StudentResourceResponse.class);
+            } catch (Exception e) {
+                log.warn("Failed to deserialize cached resource: {}", e.getMessage());
+            }
+        }
+
+        log.info("Redis cache MISS for key [{}], reading from Resources DB", cacheKey);
         StudentResource resource = studentResourceRepository
                 .findById(resourceId)
-                .orElseThrow(() ->
-                        new ResourceNotFoundException(
-                                "Student resource not found with id: " + resourceId
-                        )
-                );
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Student resource not found with id: " + resourceId));
 
-        return mapToResponse(resource);
+        StudentResourceResponse response = mapToResponse(resource);
+
+        try {
+            redisCacheService.set(cacheKey, objectMapper.writeValueAsString(response), cacheTtlSeconds);
+        } catch (Exception e) {
+            log.warn("Failed to cache resource in Redis: {}", e.getMessage());
+        }
+
+        return response;
     }
 
     private StudentResourceResponse mapToResponse(
@@ -94,11 +150,8 @@ public class StudentResourceServiceImpl implements StudentResourceService {
 
         StudentResource resource = studentResourceRepository
                 .findById(resourceId)
-                .orElseThrow(() ->
-                        new ResourceNotFoundException(
-                                "Student resource not found with id: " + resourceId
-                        )
-                );
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Student resource not found with id: " + resourceId));
 
         resource.setModuleId(request.getModuleId());
         resource.setTitle(request.getTitle());
@@ -111,10 +164,12 @@ public class StudentResourceServiceImpl implements StudentResourceService {
         resource.setMimeType(request.getMimeType());
         resource.setSortOrder(request.getSortOrder());
 
-        StudentResource updatedResource =
-                studentResourceRepository.save(resource);
+        StudentResource updatedResource = studentResourceRepository.save(resource);
+        StudentResourceResponse response = mapToResponse(updatedResource);
 
-        return mapToResponse(updatedResource);
+        evictResourceCache(resourceId, updatedResource.getModuleId());
+
+        return response;
     }
 
     @Override
@@ -122,12 +177,23 @@ public class StudentResourceServiceImpl implements StudentResourceService {
 
         StudentResource resource = studentResourceRepository
                 .findById(resourceId)
-                .orElseThrow(() ->
-                        new ResourceNotFoundException(
-                                "Student resource not found with id: " + resourceId
-                        )
-                );
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Student resource not found with id: " + resourceId));
 
+        Long moduleId = resource.getModuleId();
         studentResourceRepository.delete(resource);
+
+        evictResourceCache(resourceId, moduleId);
+    }
+
+    private void evictResourceCache(Long resourceId, Long moduleId) {
+        if (resourceId != null) {
+            redisCacheService.delete("resource:id:" + resourceId);
+        }
+        if (moduleId != null) {
+            redisCacheService.delete("resource:module:" + moduleId);
+            redisCacheService.delete("ai_resource:module:" + moduleId);
+            redisCacheService.delete("ai_content:module:" + moduleId);
+        }
     }
 }

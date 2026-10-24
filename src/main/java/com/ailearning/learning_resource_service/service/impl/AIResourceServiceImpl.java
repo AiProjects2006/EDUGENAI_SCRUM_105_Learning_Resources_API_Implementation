@@ -13,18 +13,37 @@ import com.ailearning.learning_resource_service.exception.ResourceNotFoundExcept
 import com.ailearning.learning_resource_service.repository.AIResourceChunkRepository;
 import com.ailearning.learning_resource_service.repository.AIResourceRepository;
 import com.ailearning.learning_resource_service.service.AIResourceService;
-import lombok.RequiredArgsConstructor;
+import com.ailearning.learning_resource_service.service.RedisCacheService;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 
+@Slf4j
 @Service
-@RequiredArgsConstructor
 public class AIResourceServiceImpl implements AIResourceService {
 
     private final AIResourceRepository aiResourceRepository;
     private final AIResourceChunkRepository chunkRepository;
+    private final RedisCacheService redisCacheService;
+    private final ObjectMapper objectMapper;
+
+    @Value("${app.cache.resource.ttl-seconds:86400}")
+    private long cacheTtlSeconds;
+
+    public AIResourceServiceImpl(AIResourceRepository aiResourceRepository,
+                                 AIResourceChunkRepository chunkRepository,
+                                 RedisCacheService redisCacheService,
+                                 ObjectMapper objectMapper) {
+        this.aiResourceRepository = aiResourceRepository;
+        this.chunkRepository = chunkRepository;
+        this.redisCacheService = redisCacheService;
+        this.objectMapper = objectMapper;
+    }
 
     @Override
     public AIResourceResponse createAIResource(
@@ -44,13 +63,29 @@ public class AIResourceServiceImpl implements AIResourceService {
         AIResource savedResource =
                 aiResourceRepository.save(resource);
 
-        return mapToResponse(savedResource);
+        AIResourceResponse response = mapToResponse(savedResource);
+
+        evictAICache(savedResource.getAiResourceId(), savedResource.getModuleId());
+
+        return response;
     }
 
     @Override
     public AIResourceResponse getAIResource(
             Long aiResourceId) {
 
+        String cacheKey = "ai_resource:id:" + aiResourceId;
+        String cached = redisCacheService.get(cacheKey);
+        if (cached != null && !cached.isBlank()) {
+            try {
+                log.info("Redis cache HIT for key [{}]", cacheKey);
+                return objectMapper.readValue(cached, AIResourceResponse.class);
+            } catch (Exception e) {
+                log.warn("Failed to deserialize cached AI resource: {}", e.getMessage());
+            }
+        }
+
+        log.info("Redis cache MISS for key [{}], reading from Resources DB", cacheKey);
         AIResource resource = aiResourceRepository
                 .findById(aiResourceId)
                 .orElseThrow(() ->
@@ -58,18 +93,46 @@ public class AIResourceServiceImpl implements AIResourceService {
                                 "AI Resource not found: "
                                         + aiResourceId));
 
-        return mapToResponse(resource);
+        AIResourceResponse response = mapToResponse(resource);
+
+        try {
+            redisCacheService.set(cacheKey, objectMapper.writeValueAsString(response), cacheTtlSeconds);
+        } catch (Exception e) {
+            log.warn("Failed to cache AI resource in Redis: {}", e.getMessage());
+        }
+
+        return response;
     }
 
     @Override
     public List<AIResourceResponse> getAIResourcesByModule(
             Long moduleId) {
 
-        return aiResourceRepository
+        String cacheKey = "ai_resource:module:" + moduleId;
+        String cached = redisCacheService.get(cacheKey);
+        if (cached != null && !cached.isBlank()) {
+            try {
+                log.info("Redis cache HIT for key [{}]", cacheKey);
+                return objectMapper.readValue(cached, new TypeReference<List<AIResourceResponse>>() {});
+            } catch (Exception e) {
+                log.warn("Failed to deserialize cached AI resources: {}", e.getMessage());
+            }
+        }
+
+        log.info("Redis cache MISS for key [{}], reading from Resources DB", cacheKey);
+        List<AIResourceResponse> list = aiResourceRepository
                 .findByModuleId(moduleId)
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
+
+        try {
+            redisCacheService.set(cacheKey, objectMapper.writeValueAsString(list), cacheTtlSeconds);
+        } catch (Exception e) {
+            log.warn("Failed to cache AI resources in Redis: {}", e.getMessage());
+        }
+
+        return list;
     }
 
     private AIResourceResponse mapToResponse(
@@ -94,6 +157,18 @@ public class AIResourceServiceImpl implements AIResourceService {
     @Override
     public AIContentResponse getAIContentByModule(Long moduleId) {
 
+        String cacheKey = "ai_content:module:" + moduleId;
+        String cached = redisCacheService.get(cacheKey);
+        if (cached != null && !cached.isBlank()) {
+            try {
+                log.info("Redis cache HIT for key [{}]", cacheKey);
+                return objectMapper.readValue(cached, AIContentResponse.class);
+            } catch (Exception e) {
+                log.warn("Failed to deserialize cached AI content: {}", e.getMessage());
+            }
+        }
+
+        log.info("Redis cache MISS for key [{}], reading from Resources DB", cacheKey);
         List<AIResource> resources =
                 aiResourceRepository
                         .findByModuleIdAndStatus(
@@ -106,7 +181,7 @@ public class AIResourceServiceImpl implements AIResourceService {
                         .map(resource -> {
 
                             List<AIContentChunkResponse> chunks =
-                                    chunkRepository
+                                     chunkRepository
                                             .findByAiResourceAiResourceIdOrderByChunkIndex(
                                                     resource.getAiResourceId()
                                             )
@@ -125,10 +200,18 @@ public class AIResourceServiceImpl implements AIResourceService {
                         })
                         .toList();
 
-        return AIContentResponse.builder()
+        AIContentResponse response = AIContentResponse.builder()
                 .moduleId(moduleId)
                 .resources(resourceResponses)
                 .build();
+
+        try {
+            redisCacheService.set(cacheKey, objectMapper.writeValueAsString(response), cacheTtlSeconds);
+        } catch (Exception e) {
+            log.warn("Failed to cache AI content in Redis: {}", e.getMessage());
+        }
+
+        return response;
     }
 
     private AIContentChunkResponse mapChunkToResponse(
@@ -168,7 +251,11 @@ public class AIResourceServiceImpl implements AIResourceService {
         AIResource updatedResource =
                 aiResourceRepository.save(resource);
 
-        return mapToResponse(updatedResource);
+        AIResourceResponse response = mapToResponse(updatedResource);
+
+        evictAICache(aiResourceId, updatedResource.getModuleId());
+
+        return response;
     }
 
     @Override
@@ -183,9 +270,11 @@ public class AIResourceServiceImpl implements AIResourceService {
                         )
                 );
 
+        Long moduleId = resource.getModuleId();
         chunkRepository.deleteByAiResourceAiResourceId(aiResourceId);
-
         aiResourceRepository.delete(resource);
+
+        evictAICache(aiResourceId, moduleId);
     }
 
     @Override
@@ -203,7 +292,18 @@ public class AIResourceServiceImpl implements AIResourceService {
                 );
 
         resource.setStatus(status);
-
         aiResourceRepository.save(resource);
+
+        evictAICache(aiResourceId, resource.getModuleId());
+    }
+
+    private void evictAICache(Long aiResourceId, Long moduleId) {
+        if (aiResourceId != null) {
+            redisCacheService.delete("ai_resource:id:" + aiResourceId);
+        }
+        if (moduleId != null) {
+            redisCacheService.delete("ai_resource:module:" + moduleId);
+            redisCacheService.delete("ai_content:module:" + moduleId);
+        }
     }
 }
